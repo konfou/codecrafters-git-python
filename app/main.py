@@ -1,8 +1,15 @@
+from datetime import datetime
 import binascii
 import hashlib
 import os
 import sys
 import zlib
+
+
+AUTHOR_NAME = "Author"
+AUTHOR_EMAIL = "author@example.net"
+COMMITER_NAME = AUTHOR_NAME
+COMMITER_EMAIL = AUTHOR_EMAIL
 
 
 def obj_path(obj, mknew=False):
@@ -22,7 +29,7 @@ def cat_file(opt, obj):
             data = zlib.decompress(f.read())
             ftlen, _, contents = data.partition(b'\x00')
             ftype, _ = ftlen.split()
-            if ftype == b"blob":
+            if ftype in (b"blob", b"commit"):
                 print(contents.decode(), end="")
             elif ftype == b"tree":
                 ls_tree(obj)
@@ -32,8 +39,21 @@ def cat_file(opt, obj):
         print(f"error: unknown switch `{opt}'")
 
 
-def hash_object(opts):
-    write = False
+def hash_contents(contents, obj_type="blob", write=False):
+    if not contents:
+        raise RuntimeError("fn hash_contents: Contents to hash required.")
+
+    data = b'%s %d\x00' % (obj_type.encode(), len(contents)) + contents
+    obj = hashlib.sha1(data).hexdigest()
+
+    if write:
+        with open(obj_path(obj, mknew=True), "wb") as f:
+            f.write(zlib.compress(data))
+
+    return obj
+
+
+def hash_object(opts, obj_type="blob", write=False):
     path = None
 
     if not isinstance(opts, list):
@@ -47,6 +67,9 @@ def hash_object(opts):
         else:
             path = opt
 
+    if not path:
+        raise RuntimeError("fn hash_object: Path required.")
+
     if not os.path.exists(path):
         sys.exit(f"fatal: could not open '{path}' for reading: No such file or directory")
 
@@ -56,14 +79,7 @@ def hash_object(opts):
     with open(path, "rb") as f:
         contents = f.read()
 
-    data = (b'blob %d\x00' % len(contents)) + contents
-    obj = hashlib.sha1(data).hexdigest()
-
-    if write:
-        with open(obj_path(obj, mknew=True), "wb") as blob:
-            blob.write(zlib.compress(data))
-
-    return obj
+    return hash_contents(contents, obj_type, write)
 
 
 def ls_tree(opts):
@@ -108,6 +124,7 @@ def ls_tree(opts):
 def write_tree(cwd="."):
     ls_cwd = os.listdir(cwd)
     contents = b''
+
     for entry in sorted(ls_cwd):
         if entry == ".git":
             continue
@@ -122,13 +139,47 @@ def write_tree(cwd="."):
         obj = binascii.unhexlify(obj)
         contents += mode + b' ' + entry.encode() + b'\x00' + obj
 
-    data = (b'tree %d\x00' % len(contents)) + contents
-    obj = hashlib.sha1(data).hexdigest()
+    return hash_contents(contents, "tree", True)
 
-    with open(obj_path(obj, mknew=True), "wb") as tree:
-        tree.write(zlib.compress(data))
 
-    return obj
+def commit_tree(opts):
+    tree_sha = None
+    parent_sha = None
+    message = None
+    skip_next = False
+
+    # XXX: use getopt/argparse
+    for i, opt in enumerate(opts):
+        if skip_next:
+            skip_next = False
+            continue
+        if opt == "-p":
+            parent_sha = opts[i + 1]
+            skip_next = True
+        elif opt == "-m":
+            message = opts[i + 1]
+            skip_next = True
+        elif opt[0] == "-":
+            sys.exit(f"error: unknown switch `{opt}'")
+        else:
+            tree_sha = opt
+
+    # lazy error handling
+    _ = obj_path(tree_sha)
+    _ = obj_path(parent_sha)
+
+    now = datetime.now().astimezone()
+    # "%s" is not portable; depends on system's strftime
+    # timestamp = now.strftime("%s %z")
+    timestamp = str(int(now.timestamp())) + now.strftime("%z")
+
+    contents = f"tree {tree_sha}\nparent {parent_sha}\n"
+    contents += f"author {AUTHOR_NAME} <{AUTHOR_EMAIL}> {timestamp}\n"
+    contents += f"commiter {COMMITER_NAME} <{COMMITER_EMAIL}> {timestamp}\n"
+    contents += f"\n{message}\n"
+    contents = contents.encode()
+
+    return hash_contents(contents, "commit", True)
 
 
 def main():
@@ -158,8 +209,13 @@ def main():
         ls_tree(sys.argv[2:])
     elif command == "write-tree":
         print(write_tree())
+    elif command == "commit-tree":
+        if len(sys.argv) < 7:
+            print("fatal: five arguments required")
+            return
+        print(commit_tree(sys.argv[2:]))
     else:
-        raise RuntimeError(f"Unknown command #{command}")
+        raise sys.exit(f"Unknown command #{command}")
 
 
 if __name__ == "__main__":
